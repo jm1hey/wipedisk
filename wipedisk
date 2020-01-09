@@ -1,0 +1,621 @@
+#!/bin/bash
+
+# Copyright (c) 2020 jm1hey
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+# Version
+readonly SCRIPT_VERSION="1.1"
+
+# get/set command name
+#readonly CMDNAME="${BASH_SOURCE##*/}"
+readonly CMDNAME="wipedisk"
+
+# The purpose of this script is described in the 'printhelp' function defined below.
+
+# define error codes
+readonly ERR_INVALID_ARG=1
+readonly ERR_UTIL_MISSING=2
+readonly ERR_UTIL_COMPAT=3
+readonly ERR_PERM=4
+
+# define utility mode constants
+readonly UTILMODE_DCFLDD=3
+readonly UTILMODE_DD_PROG=2
+readonly UTILMODE_DD_NOPROG=1
+readonly UTILMODE_NONE=0
+
+# define default option values
+readonly DEFAULT_RANDOM_PASSES=3
+readonly DEFAULT_ZERO_PASSES=1
+
+# define other constants
+readonly OPTIONS_PER_PAGE=5 # how many options to show together when selecting target
+readonly CONFIRM_PHRASE="yes, erase" # phrase to prompt for entry when confirming wipe
+readonly MAX_ADJUSTED_BLOCKSIZE=$((2**21)) # in bytes -- to improve efficiency, multiply optimal I/O size (as reported by fdisk) by powers of 2, up to a maximum of this value
+
+# ensure Bash version is sufficient
+if [ -z "${BASH_VERSINFO[0]}" ] || ((BASH_VERSINFO[0] < 3))
+then
+  echo "Error: Bash 3.0 or later is required"
+  exit $ERR_UTIL_COMPAT
+fi
+
+# define usage and help functions
+function printusage {
+	echo \
+"Usage: $CMDNAME [OPTION(s)] --target=TARGET_DEVICE_PATH
+
+Options:
+	--help
+		Print help information and exit
+
+	--version
+		Print version information and exit
+
+	--force
+		Do not prompt for confirmation before proceeding with wipe
+
+	--dryrun | -d
+		Set up wipe operation but do not proceed
+		(overrides --force)
+
+	--random_passes=NUMBER_OF_RANDOM_PASSES
+		How many times to write random bytes over the target device
+		Default: $DEFAULT_RANDOM_PASSES
+
+	-rp=NUMBER_OF_RANDOM_PASSES
+		Same as --random_passes
+
+	--zero_passes=NUMBER_OF_ZERO_PASSES
+		How many times to write null bytes over the target device
+		Default: $DEFAULT_ZERO_PASSES
+
+	-zp=NUMBER_OF_ZERO_PASSES
+		Same as --zero_passes
+
+Notes:
+	TARGET_DEVICE_PATH should be the full path to a disk or partition device (e.g. /dev/sda)
+"
+}
+
+function printhelp {
+	echo
+	echo \
+"'$CMDNAME' is a Bash script that utilizes either dcfldd or dd to write random and/or null bytes to a device in a configurable number of passes. It is intended for securely erasing all of the data on a hard disk or partition. Note: wiping partitions is currently not supported on disks with BSD disklabels. Furthermore, a compatible version of the 'fdisk' utility is required. As a result, this script does not work on Mac OSX; it is primarily intended for use in Linux systems.
+"
+	printusage
+}
+
+function printversion {
+	echo "$SCRIPT_VERSION"
+}
+
+function check_coreutils_version {
+	dd_version="$(dd --version | head -n 1)"
+	dd_version="${dd_version##* }"
+	checked_major_ver="${dd_version%.*}"
+	checked_minor_ver="${dd_version#*.}"
+	if ([ "$checked_major_ver" -eq 8 ] && [ "$checked_minor_ver" -ge 24 ]) || \
+		[ "$checked_major_ver" -gt 8 ]
+	then
+		return 0 # version 8.24 or later
+	else
+		return 1
+	fi
+}
+
+function print_setup {
+	if [ "$util_mode" == $UTILMODE_NONE ]
+	then
+		dd_cmd_temp="dd bs=$DD_BLOCKSIZE"
+	else
+		dd_cmd_temp="$dd_cmd"
+	fi
+	echo \
+"
+Disk wipe operation:
+
+WARNING: this will permanently erase the target device
+
+Target:"
+fdisk -l "$opt_target" --units=sectors -o "Type,Size,Start,End,Sectors"
+echo "
+Target type: ""$target_type""
+"
+echo \
+"Random pass command: $dd_cmd_temp if=\"/dev/urandom\" of=\"$opt_target\"
+Number of random passes: $opt_random_passes
+
+Zero pass command: $dd_cmd_temp if=\"/dev/zero\" of=\"$opt_target\"
+Number of zero passes: $opt_zero_passes
+"
+}
+
+###########################################
+
+# check for "--help" argument
+for i in "$@"
+do
+	if [ "$i" == "--help" ]
+	then
+		# print help text
+		printhelp
+		exit 0
+	fi
+done
+
+# check for "--version" argument
+for i in "$@"
+do
+	if [ "$i" == "--version" ]
+	then
+		printversion
+		exit 0
+	fi
+done
+
+# check whether user has root privileges
+if (( EUID != 0 ))
+then
+	echo "Error: root privileges required"
+	exit $ERR_PERM
+fi
+
+# make sure fdisk is available
+if ! which fdisk > /dev/null
+then
+	echo "Error: missing fdisk utility"
+	exit $ERR_UTIL_MISSING
+fi
+
+# check available utility
+if which dcfldd > /dev/null
+then
+	util_mode=$UTILMODE_DCFLDD # dcfldd is available
+else
+	if which dd > /dev/null
+	then
+		# check whether dd supports progress status output
+		if (dd --version | grep -q -i coreutils) && check_coreutils_version
+		then
+			util_mode=$UTILMODE_DD_PROG # dd is available with progress status output
+		else
+			util_mode=$UTILMODE_DD_NOPROG # dd is available but without progress status output
+		fi
+	else
+		util_mode=$UTILMODE_NONE # neither dcfldd nor dd is available
+	fi
+fi
+
+# set default options
+opt_dryrun=0
+opt_force=0
+opt_random_passes=$DEFAULT_RANDOM_PASSES
+opt_zero_passes=$DEFAULT_ZERO_PASSES
+
+# check for "--dryrun" or "-d"
+num_i=1
+for i in "$@"
+do
+	if [ "$i" == "--dryrun" ] || [ "$i" == "-d" ]
+	then
+		opt_dryrun=1
+		argvalid[$num_i]=1
+	fi
+	num_i=$((num_i+1))
+done
+
+# check for "--force"
+num_i=1
+for i in "$@"
+do
+	if [ "$i" == "--force" ]
+	then
+		opt_force=1
+		argvalid[$num_i]=1
+	fi
+	num_i=$((num_i+1))
+done
+
+# check for random passes option
+num_i=1
+for i in "$@"
+do
+	if [ "${i:0:16}" == "--random_passes=" ]
+	then
+		if [ ${#i} -gt 16 ]
+		then
+			if [[ "${i:16}" =~ ^[0-9]+$ ]]
+			then
+				opt_random_passes="${i:16}"
+				argvalid[$num_i]=1 # mark argument as valid
+			else
+				argvalid[$num_i]=0 # mark argument as invalid
+			fi
+		else
+			argvalid[$num_i]=0 # mark argument as invalid
+		fi
+	elif [ "${i:0:4}" == "-rp=" ]
+	then
+		if [ ${#i} -gt 4 ]
+		then
+			if [[ "${i:4}" =~ ^[0-9]+$ ]]
+			then
+				opt_random_passes="${i:4}"
+				argvalid[$num_i]=1 # mark argument as valid
+			else
+				argvalid[$num_i]=0 # mark argument as invalid
+			fi
+		else
+			argvalid[$num_i]=0 # mark argument as invalid
+		fi
+	fi
+	num_i=$((num_i+1))
+done
+
+# check for zero passes option
+num_i=1
+for i in "$@"
+do
+	if [ "${i:0:14}" == "--zero_passes=" ]
+	then
+		if [ ${#i} -gt 14 ]
+		then
+			if [[ "${i:14}" =~ ^[0-9]+$ ]]
+			then
+				opt_zero_passes="${i:14}"
+				argvalid[$num_i]=1 # mark argument as valid
+			else
+				argvalid[$num_i]=0 # mark argument as invalid
+			fi
+		else
+			argvalid[$num_i]=0 # mark argument as invalid
+		fi
+	elif [ "${i:0:4}" == "-zp=" ]
+	then
+		if [ ${#i} -gt 4 ]
+		then
+			if [[ "${i:4}" =~ ^[0-9]+$ ]]
+			then
+				opt_zero_passes="${i:4}"
+				argvalid[$num_i]=1 # mark argument as valid
+			else
+				argvalid[$num_i]=0 # mark argument as invalid
+			fi
+		else
+			argvalid[$num_i]=0 # mark argument as invalid
+		fi
+	fi
+	num_i=$((num_i+1))
+done
+
+# check for target option
+num_i=1
+for i in "$@"
+do
+	if [ "${i:0:9}" == "--target=" ]
+	then
+		if [ ${#i} -gt 9 ]
+		then
+			if [ -n "$opt_target" ]
+			then
+				# for safety, exit with error if the target is set more than once
+				echo "Error: multiple target arguments"
+				exit $ERR_INVALID_ARG
+			fi
+			opt_target="${i:9}"
+			argvalid[$num_i]=1 # mark argument as valid
+		else
+			argvalid[$num_i]=0 # mark argument as invalid
+		fi
+	fi
+	num_i=$((num_i+1))
+done
+
+# reject any invalid arguments
+num_i=1
+for arg in "$@"
+do
+	if [ "${argvalid[$num_i]}" != "1" ]
+	then
+		echo
+		echo "Error: invalid argument: $arg"
+		printusage
+		exit $ERR_INVALID_ARG
+	fi
+	num_i=$((num_i+1))
+done
+
+# determine valid targets and parse target information
+set -f
+if ! fdo=($(fdisk -l --units=sectors -o Start))
+then
+	echo "Error: incompatible fdisk version"
+	exit $ERR_UTIL_COMPAT
+fi
+set +f
+fdo_len=${#fdo[@]}
+disk=()
+num_disks=0
+## find all disks
+for i in $(eval echo {0..$((fdo_len-1))})
+do
+	if [ "${fdo[$i]}" == "Disk" ] && [ "${fdo[$((i+1))]:0:1}" == "/" ] && [ "${fdo[$((i+1))]: -1}" == ":" ]
+	then
+		disk[$num_disks]="${fdo[$((i+1))]:0:-1}"
+		num_disks=$((num_disks+1))
+	fi
+done
+## find partitions corresponding to each disk and assemble target options array
+target_option=()
+num_target_options=0
+for i in $(eval echo {0..$((num_disks-1))})
+do
+	target_option[$((num_target_options*2))]="${disk[$i]}" # an even index represents the target itself
+	target_option[$((num_target_options*2+1))]="disk" # an odd index represents the target type
+	num_target_options=$((num_target_options+1))
+	if fdisk -l "${disk[$i]}" --units=sectors | grep -i -q "Disklabel type: bsd"
+	then
+		# wiping partitions is not supported for BSD type disklabels
+		continue
+	fi
+	set -f
+	if ! fdo=($(fdisk -l "${disk[$i]}" --units=sectors -o Device))
+	then
+		echo "Error: incompatible fdisk version"
+		exit $ERR_UTIL_COMPAT
+	fi
+	set +f
+	fdo_len=${#fdo[@]}
+	j=0
+	while ! ([ "${fdo[$((j-1))]}" == "Device" ] && [ "${fdo[$j]:0:1}" == "/" ])
+	do
+		j=$((j+1))
+		if [ $j -ge $fdo_len ]
+		then
+			break # no partitions found
+		fi
+	done
+	while [ $j -lt $fdo_len ]
+	do
+		target_option[$((num_target_options*2))]="${fdo[$j]}"
+		target_option[$((num_target_options*2+1))]="partition"
+		num_target_options=$((num_target_options+1))
+		j=$((j+1))
+	done
+done
+unset fdo
+unset fdo_len
+if [ -n "$opt_target" ]
+then
+	# validate target option
+	target_valid=0
+	for i in $(eval echo {0..$((num_target_options-1))})
+	do
+		if [ "$opt_target" == "${target_option[$((i*2))]}" ]
+		then
+			target_type="${target_option[$((i*2+1))]}"
+			target_valid=1
+			break
+		fi
+	done
+	if [ $target_valid == 0 ]
+	then
+		echo "Error: invalid target"
+		exit $ERR_INVALID_ARG
+	fi
+elif [ $opt_force == 1 ]
+then
+	echo "Error: argument '--force' is invalid if '--target' is not supplied"
+	exit $ERR_INVALID_ARG
+fi
+# argument parsing and validation is complete
+
+if [ -z "$opt_target" ]
+then
+	# target is not yet chosen -- show menu of options
+	num_last_page_options=$((num_target_options%OPTIONS_PER_PAGE))
+	num_pages=$((num_target_options/OPTIONS_PER_PAGE))
+	if [ $num_last_page_options == 0 ]
+	then
+		if [ $num_pages == 0 ]
+		then
+			echo "No target options found"
+			exit 0
+		else
+			num_last_page_options=$OPTIONS_PER_PAGE
+		fi
+	else
+		num_pages=$((num_pages+1))
+	fi
+	curr_page=1
+	while :
+	do
+		page_target_option=()
+		for i in $(eval echo {0..$((OPTIONS_PER_PAGE-1))})
+		do
+			page_target_option[$i]="${target_option[$((((curr_page-1)*OPTIONS_PER_PAGE+i)*2))]}"" ("
+			page_target_option[$i]="${page_target_option[$i]}""${target_option[$((((curr_page-1)*OPTIONS_PER_PAGE+i)*2+1))]}"")"
+			if [ $curr_page == $num_pages ] && [ $((i+1)) -ge $num_last_page_options ]
+			then
+				break
+			fi
+		done
+		page_target_option[$((i+1))]="[Cancel]"
+		if [ $curr_page -lt $num_pages ]
+		then
+			page_target_option[$((i+2))]="[Next page]"
+			if [ $curr_page -gt 1 ]
+			then
+				page_target_option[$((i+3))]="[Previous page]"
+			fi
+		elif [ $curr_page -gt 1 ]
+		then
+			page_target_option[$((i+2))]="[Previous page]"
+		fi
+		echo
+		echo "Target options (page $curr_page of $num_pages):"
+		select selection in "${page_target_option[@]}"
+		do
+			if [ "$REPLY" == "$((i+2))" ]
+			then
+				echo "Cancelled"
+				exit 0
+			elif [ "$REPLY" == "$((i+3))" ]
+			then
+				if [ $curr_page -lt $num_pages ]
+				then
+					curr_page=$((curr_page+1))
+					break
+				elif [ $curr_page -gt 1 ]
+				then
+					curr_page=$((curr_page-1))
+					break
+				else
+					echo "Invalid entry"
+					break
+				fi
+			elif [ "$REPLY" == "$((i+4))" ]
+			then
+				if ([ $curr_page -lt $num_pages ] && [ $curr_page -gt 1 ])
+				then
+					curr_page=$((curr_page-1))
+					break
+				else
+					echo "Invalid entry"
+					break
+				fi
+			elif ([ $curr_page -gt 1 ] && [ "$REPLY" == "$((i+3))" ])
+			then
+				curr_page=$((curr_page-1))
+				break
+			elif ([[ "$REPLY" =~ ^[0-9]+$ ]] && [ "$REPLY" -ge "1" ] && [ "$REPLY" -le "$((i+1))" ])
+			then
+				opt_target="${target_option[$((((curr_page-1)*OPTIONS_PER_PAGE+REPLY-1)*2))]}"
+				target_type="${target_option[$((((curr_page-1)*OPTIONS_PER_PAGE+REPLY-1)*2+1))]}"
+				break 2
+			else
+				echo "Invalid entry"
+				break
+			fi
+		done
+	done
+	unset target_option
+	unset page_target_option
+fi
+
+# determine optimal I/O block size
+set -f
+if ! fdo=($(fdisk -l "$opt_target" --units=sectors -o Start))
+then
+	echo "Error: incompatible fdisk version"
+	exit $ERR_UTIL_COMPAT
+fi
+set +f
+fdo_len=${#fdo[@]}
+for i in $(eval echo {0..$((fdo_len-1))})
+do
+	if [ "${fdo[$i]}" == "I/O" ] && [ "${fdo[$((i+2))]}" == "(minimum/optimal):" ] && [ "${fdo[$((i+7))]}" == "bytes" ]
+	then
+		io_size_optimal="${fdo[$((i+6))]}"
+		if ! [[ "$io_size_optimal" =~ ^[0-9]+$ ]]
+		then
+			echo "Error: incompatible fdisk version"
+			exit $ERR_UTIL_COMPAT
+		fi
+		break
+	fi
+done
+## choose the largest reasonable block size based on the size of the device and the number of sectors
+if ! ([ "${fdo[5]}" == "bytes," ] && [ "${fdo[7]}" == "sectors" ])
+then
+	echo "Error: could not parse fdisk output"
+	exit $ERR_UTIL_COMPAT
+fi
+target_size=${fdo[4]}
+for (( i = 0; (io_size_optimal*2**i) < MAX_ADJUSTED_BLOCKSIZE; i++ ))
+do
+	if [ $((target_size%(io_size_optimal*2**(i+1)))) -ne 0 ]
+	then
+		break
+	fi
+done
+DD_BLOCKSIZE=$((io_size_optimal*2**i))
+unset fdo
+unset fdo_len
+
+# set up wipe command
+dd_cmd=""
+if [ "$util_mode" == $UTILMODE_DCFLDD ]
+then
+	dd_cmd="dcfldd status=on bs=$DD_BLOCKSIZE"
+elif [ "$util_mode" == $UTILMODE_DD_PROG ]
+then
+	dd_cmd="dd status=progress bs=$DD_BLOCKSIZE"
+elif [ "$util_mode" == $UTILMODE_DD_NOPROG ]
+then
+	dd_cmd="dd bs=$DD_BLOCKSIZE"
+fi
+
+# perform dry run if appropriate
+if [ "$util_mode" == $UTILMODE_NONE ] || [ "$opt_dryrun" == 1 ]
+then
+	print_setup
+	echo "Dry run specified or dd utility not available -- exiting"
+	exit 0
+fi
+
+# confirm operation
+print_setup
+wipe_confirmed=0
+if [ "$opt_force" == 1 ]
+then
+	echo "Force argument specified -- proceeding with wipe"
+	wipe_confirmed=1
+else
+	echo "Are you sure you want to erase the selected target device?"
+	read -p "Enter \"$CONFIRM_PHRASE\" to confirm, or anything else to cancel: " confirm_choice
+	if [ "$confirm_choice" != "$CONFIRM_PHRASE" ]
+	then
+		echo "Aborting wipe"
+		exit 0
+	else
+		wipe_confirmed=1
+	fi
+fi
+
+if [ "$wipe_confirmed" == 1 ]
+then
+	echo "Beginning wipe"
+	if [ "$util_mode" == $UTILMODE_DD_NOPROG ]
+	then
+		echo "Note: current dd version does not support progress status output"
+	fi
+	# perform random passes
+	for (( i = 1; i <= opt_random_passes; i++ ))
+	do
+		echo "Performing random pass $i of $opt_random_passes"
+		$dd_cmd if="/dev/urandom" of="$opt_target"
+	done
+	if [ $opt_random_passes -ge 1 ]
+	then
+		echo "$opt_random_passes of $opt_random_passes random passes complete"
+	fi
+	# perform zero passes
+	for (( i = 1; i <= opt_zero_passes; i++ ))
+	do
+		echo "Performing zero pass $i of $opt_zero_passes"
+		$dd_cmd if="/dev/zero" of="$opt_target"
+	done
+	if [ $opt_zero_passes -ge 1 ]
+	then
+		echo "$opt_zero_passes of $opt_zero_passes zero passes complete"
+	fi
+	echo "Finished"
+fi
+exit 0
