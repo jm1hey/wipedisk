@@ -1,0 +1,2 @@
+# wipedisk
+A Bash script that utilizes either dcfldd or dd to write random and/or null bytes to a device in a configurable number of passes. It is intended for securely erasing all of the data on a hard drisk or partition. Note: wiping partitions is currently not supported on disks with BSD disklabels. Furthermore, a compatible version of the 'fdisk' utility is required. As a result, this script does not work on Mac OSX; it is primarily intended for use in Linux systems.
