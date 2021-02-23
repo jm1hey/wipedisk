@@ -9,7 +9,7 @@
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 # Version
-readonly SCRIPT_VERSION="1.1"
+readonly SCRIPT_VERSION="1.2"
 
 # get/set command name
 #readonly CMDNAME="${BASH_SOURCE##*/}"
@@ -48,7 +48,7 @@ fi
 # define usage and help functions
 function printusage {
 	echo \
-"Usage: $CMDNAME [OPTION(s)] --target=TARGET_DEVICE_PATH
+"Usage: $CMDNAME [--target=TARGET_DEVICE_PATH] [OPTION(s)]
 
 Options:
 	--help
@@ -59,6 +59,7 @@ Options:
 
 	--force
 		Do not prompt for confirmation before proceeding with wipe
+		Note: this option is invalid if target is not passed by argument
 
 	--dryrun | -d
 		Set up wipe operation but do not proceed
@@ -67,6 +68,7 @@ Options:
 	--random_passes=NUMBER_OF_RANDOM_PASSES
 		How many times to write random bytes over the target device
 		Default: $DEFAULT_RANDOM_PASSES
+		Note: this option is ignored if target is not passed by argument
 
 	-rp=NUMBER_OF_RANDOM_PASSES
 		Same as --random_passes
@@ -74,12 +76,14 @@ Options:
 	--zero_passes=NUMBER_OF_ZERO_PASSES
 		How many times to write null bytes over the target device
 		Default: $DEFAULT_ZERO_PASSES
+		Note: this option is ignored if target is not passed by argument
 
 	-zp=NUMBER_OF_ZERO_PASSES
 		Same as --zero_passes
 
 Notes:
-	TARGET_DEVICE_PATH should be the full path to a disk or partition device (e.g. /dev/sda)
+	TARGET_DEVICE_PATH should be the full path to a disk or partition device (e.g. /dev/sda1)
+	If target is not passed by argument, an interactive setup prompt will be started
 "
 }
 
@@ -418,7 +422,7 @@ fi
 
 if [ -z "$opt_target" ]
 then
-	# target is not yet chosen -- show menu of options
+	# target is not yet chosen -- show menu
 	num_last_page_options=$((num_target_options%OPTIONS_PER_PAGE))
 	num_pages=$((num_target_options/OPTIONS_PER_PAGE))
 	if [ $num_last_page_options == 0 ]
@@ -507,6 +511,42 @@ then
 	done
 	unset target_option
 	unset page_target_option
+
+	# while we're at it, prompt for random_passes and zero_passes
+	while :
+	do
+		echo "How many random byte passes? (Leave blank for default: $DEFAULT_RANDOM_PASSES)"
+		read -p "-->: " random_passes_entry
+		if [[ "$random_passes_entry" =~ ^[0-9]+$ ]]
+		then
+			opt_random_passes="$random_passes_entry"
+			unset random_passes_entry
+			break
+		elif [[ -z "$random_passes_entry" ]]
+		then
+			opt_random_passes="$DEFAULT_RANDOM_PASSES"
+			break
+		else
+			echo "Invalid entry"
+		fi
+	done
+	while :
+	do
+		echo "How many zero byte passes? (Leave blank for default: $DEFAULT_ZERO_PASSES)"
+		read -p "-->: " zero_passes_entry
+		if [[ "$zero_passes_entry" =~ ^[0-9]+$ ]]
+		then
+			opt_zero_passes="$zero_passes_entry"
+			unset zero_passes_entry
+			break
+		elif [[ -z "$zero_passes_entry" ]]
+		then
+			opt_zero_passes="$DEFAULT_ZERO_PASSES"
+			break
+		else
+			echo "Invalid entry"
+		fi
+	done
 fi
 
 # determine optimal I/O block size
